@@ -1,6 +1,6 @@
 """
 Sitekey finder. Run once per shop:
-    python3 getkey.py https://stickerhorse.com http://user:pass@host:port
+    python3 getkey.py https://store.com http://user:pass@host:port
 """
 import re
 import sys
@@ -75,6 +75,7 @@ def main():
             elif u.startswith("/"):  u = shop + u
             elif not u.startswith("http"): continue
             js_urls.add(u)
+
         print(f"[*] {len(js_urls)} bundles")
         for u in sorted(js_urls):
             try:
