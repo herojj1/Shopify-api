@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>🛒 Shopify Fetcher — Fast · Accurate · Zero Errors</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet" />
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#03080a;--panel:#08130f;--panel2:#0c1a14;--border:#132a20;
+  --green:#00ff88;--green-d:#00c96a;--green-glow:rgba(0,255,136,.18);
+  --text:#d8f5e3;--text2:#7a9c88;--text3:#4a6355;
+  --mono:'JetBrains Mono',monospace;
+}
+html,body{height:100%}
+body{background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;min-height:100vh;
+  background-image:
+    radial-gradient(ellipse at 20% 0%,rgba(0,255,136,.07),transparent 45%),
+    radial-gradient(ellipse at 80% 100%,rgba(0,255,136,.05),transparent 45%);}
+.wrap{max-width:920px;margin:0 auto;padding:28px 18px 80px}
+
+/* ── header ────────────────────────────────────────────── */
+header{border:1px solid var(--border);border-radius:16px;background:var(--panel);
+  padding:22px 26px;margin-bottom:16px;position:relative;overflow:hidden;
+  background-image:linear-gradient(135deg,rgba(0,255,136,.05),transparent 60%)}
+header::before{content:'';position:absolute;top:0;left:0;right:0;height:1px;
+  background:linear-gradient(90deg,transparent,var(--green),transparent);opacity:.4}
+.title{font-size:23px;font-weight:900;letter-spacing:-.7px;display:flex;align-items:center;gap:11px}
+.title .emoji{font-size:27px;filter:drop-shadow(0 0 8px rgba(0,255,136,.4))}
+.sub{color:var(--text2);font-size:13px;margin-top:7px;font-family:var(--mono);letter-spacing:.2px}
+.tagline{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+.pill{font-family:var(--mono);font-size:10.5px;font-weight:700;letter-spacing:.8px;
+  padding:4px 11px;border-radius:20px;background:rgba(0,255,136,.06);
+  border:1px solid rgba(0,255,136,.22);color:var(--green);text-transform:uppercase}
+.stats{display:flex;gap:18px;margin-top:16px;flex-wrap:wrap}
+.stat{display:flex;align-items:center;gap:7px;font-size:11.5px;color:var(--text2);font-family:var(--mono)}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 10px var(--green);
+  animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+
+/* ── panels ────────────────────────────────────────────── */
+.panel{border:1px solid var(--border);border-radius:14px;background:var(--panel);
+  padding:22px 24px;margin-bottom:14px}
+.label{font-family:var(--mono);font-size:10.5px;font-weight:700;letter-spacing:1.6px;color:var(--green);
+  text-transform:uppercase;margin-bottom:14px;display:flex;align-items:center;gap:9px}
+.label::after{content:'';flex:1;height:1px;background:linear-gradient(90deg,var(--border),transparent)}
+
+.field{margin-bottom:14px}
+.field-label{font-size:11.5px;color:var(--text2);margin-bottom:6px;font-weight:500;
+  display:flex;justify-content:space-between;align-items:center}
+.field-label .hint{font-family:var(--mono);font-size:10px;color:var(--text3)}
+
+input[type=text],input[type=number]{
+  width:100%;background:#040c08;border:1px solid var(--border);border-radius:10px;
+  padding:12px 14px;color:var(--text);font-family:var(--mono);font-size:13px;outline:none;
+  transition:border-color .15s,box-shadow .15s}
+input:focus{border-color:var(--green);box-shadow:0 0 0 3px var(--green-glow)}
+input:disabled{opacity:.55;cursor:not-allowed;color:var(--green);font-weight:700}
+
+.row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+@media(max-width:600px){.row{grid-template-columns:1fr}}
+
+.tiers{display:flex;gap:9px;margin-top:8px;flex-wrap:wrap}
+.tier{display:flex;align-items:center;gap:7px;padding:7px 14px;border:1px solid var(--border);
+  border-radius:8px;font-size:12px;cursor:pointer;transition:all .15s;font-family:var(--mono);
+  background:#040c08;user-select:none}
+.tier:hover{border-color:var(--green-d)}
+.tier input{accent-color:var(--green);cursor:pointer}
+.tier.active{border-color:var(--green);background:rgba(0,255,136,.06);color:var(--green)}
+
+.toggle-row{display:flex;align-items:center;justify-content:space-between;padding:11px 0;
+  border-top:1px solid var(--border)}
+.toggle-row:first-child{border-top:none;padding-top:0}
+.toggle-label{font-size:12.5px;color:var(--text2)}
+.switch{position:relative;width:44px;height:24px;background:#040c08;border:1px solid var(--border);
+  border-radius:14px;cursor:pointer;transition:all .2s;flex-shrink:0}
+.switch::after{content:'';position:absolute;top:2px;left:2px;width:18px;height:18px;border-radius:50%;
+  background:var(--text3);transition:all .2s}
+.switch.on{background:rgba(0,255,136,.15);border-color:var(--green)}
+.switch.on::after{transform:translateX(20px);background:var(--green);box-shadow:0 0 8px var(--green)}
+
+.btn{background:linear-gradient(135deg,var(--green),var(--green-d));border:none;border-radius:11px;
+  padding:14px 26px;color:#04120a;font-weight:900;font-size:13.5px;letter-spacing:.6px;cursor:pointer;
+  width:100%;font-family:var(--mono);transition:transform .12s,box-shadow .12s;text-transform:uppercase}
+.btn:hover:not(:disabled){transform:translateY(-1px);box-shadow:0 8px 28px rgba(0,255,136,.3)}
+.btn:disabled{opacity:.5;cursor:wait}
+
+/* ── output ────────────────────────────────────────────── */
+.out-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;gap:12px;flex-wrap:wrap}
+.out-title{font-family:var(--mono);font-size:10.5px;font-weight:700;letter-spacing:1.6px;color:var(--green);text-transform:uppercase}
+.out-meta{font-size:10.5px;color:var(--text3);font-family:var(--mono)}
+.acts{display:flex;gap:7px;flex-wrap:wrap}
+.mini{background:transparent;border:1px solid var(--border);border-radius:8px;padding:6px 12px;
+  color:var(--text2);font-family:var(--mono);font-size:10.5px;cursor:pointer;transition:all .12s;
+  text-transform:uppercase;font-weight:600;letter-spacing:.5px}
+.mini:hover{border-color:var(--green);color:var(--green)}
+
+.results{display:flex;flex-direction:column;gap:8px;margin-top:10px}
+.card{border:1px solid var(--border);border-radius:11px;background:var(--panel2);padding:13px 16px;
+  transition:all .15s;position:relative;opacity:0;animation:slidein .25s forwards}
+@keyframes slidein{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
+.card:hover{border-color:var(--green-d);background:#0f2018}
+.card-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:7px}
+.card-idx{font-family:var(--mono);font-size:10.5px;color:var(--text3)}
+.card-site{font-family:var(--mono);font-size:13.5px;font-weight:700;color:var(--green);word-break:break-all}
+.copy-btn{background:transparent;border:1px solid var(--border);border-radius:6px;padding:4px 10px;
+  color:var(--text3);font-family:var(--mono);font-size:10px;cursor:pointer;transition:all .12s;
+  flex-shrink:0;font-weight:600}
+.copy-btn:hover{border-color:var(--green);color:var(--green)}
+.copy-btn.copied{border-color:var(--green);color:#04120a;background:var(--green)}
+.card-meta{display:flex;flex-wrap:wrap;gap:12px;font-family:var(--mono);font-size:11.5px;margin-bottom:7px}
+.card-meta .kv{display:flex;gap:5px;align-items:center}
+.card-meta .k{color:var(--text3);font-size:10.5px;letter-spacing:.5px}
+.card-meta .v{color:var(--text)}
+.card-meta .v.price{color:var(--green);font-weight:700}
+.card-checkout{font-family:var(--mono);font-size:10.5px;color:var(--text2);word-break:break-all;
+  padding:6px 10px;background:#040c08;border-radius:6px;border:1px solid var(--border);cursor:pointer;
+  transition:all .12s}
+.card-checkout:hover{border-color:var(--green);color:var(--green)}
+.tag{display:inline-block;font-family:var(--mono);font-size:9.5px;padding:2px 8px;border-radius:5px;
+  background:rgba(0,255,136,.08);color:var(--green);border:1px solid rgba(0,255,136,.2);margin-top:6px;
+  max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+.empty{text-align:center;padding:44px 20px;color:var(--text3);font-family:var(--mono);font-size:12.5px}
+.empty .big{font-size:32px;opacity:.3;margin-bottom:8px;display:block}
+.spinner{display:inline-block;width:14px;height:14px;border:2px solid var(--border);border-top-color:var(--green);
+  border-radius:50%;animation:spin .6s linear infinite;vertical-align:middle;margin-right:9px}
+@keyframes spin{to{transform:rotate(360deg)}}
+.progress{height:3px;background:var(--border);border-radius:2px;overflow:hidden;margin-top:10px}
+.progress-bar{height:100%;background:linear-gradient(90deg,var(--green),var(--green-d));
+  width:0;transition:width .3s;box-shadow:0 0 12px var(--green)}
+
+.err{border:1px solid #7a2222;background:rgba(122,34,34,.08);color:#ff9090;padding:14px 18px;border-radius:10px;
+  font-family:var(--mono);font-size:11.5px}
+footer{text-align:center;margin-top:36px;color:var(--text3);font-family:var(--mono);font-size:10.5px;line-height:2}
+footer a{color:var(--green);text-decoration:none}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div class="title"><span class="emoji">🛒</span> Shopify Fetcher</div>
+    <div class="sub">Direct API · Real-time streaming · Smart auto-search</div>
+    <div class="tagline">
+      <span class="pill">⚡ Fast</span>
+      <span class="pill">🎯 Accurate</span>
+      <span class="pill">🛡 Zero Errors</span>
+      <span class="pill">🤖 Automatic</span>
+      <span class="pill">💵 $0.10 – $5.00</span>
+    </div>
+    <div class="stats">
+      <div class="stat"><span class="dot"></span> ONLINE <span id="online">1</span></div>
+      <div class="stat">SEARCHES <span id="visits">—</span></div>
+      <div class="stat">BY Mod_By_Kamal</div>
+    </div>
+  </header>
+
+  <div class="panel">
+    <div class="label">SEARCH</div>
+
+    <div class="field">
+      <div class="field-label">
+        <span>Keyword</span>
+        <span class="hint">auto-runs on type</span>
+      </div>
+      <input type="text" id="keyword" placeholder="socks  →  typing starts search automatically" autocomplete="off" />
+    </div>
+
+    <div class="row">
+      <div class="field">
+        <div class="field-label"><span>Result Count</span></div>
+        <input type="number" id="result" value="100" min="10" max="1000" />
+      </div>
+      <div class="field">
+        <div class="field-label"><span>Price Band</span><span class="hint">locked</span></div>
+        <input type="text" value="$0.10 – $5.00" disabled />
+      </div>
+    </div>
+
+    <div class="label" style="margin-top:16px">OPTIONS</div>
+    <div class="toggle-row">
+      <span class="toggle-label">Available only</span>
+      <div class="switch on" id="availSwitch"></div>
+    </div>
+    <div class="toggle-row">
+      <span class="toggle-label">Stream results live (NDJSON)</span>
+      <div class="switch" id="streamSwitch"></div>
+    </div>
+
+    <button class="btn" id="go" style="margin-top:14px">Execute</button>
+    <div class="progress" id="progressWrap" style="display:none"><div class="progress-bar" id="progressBar"></div></div>
+
+    <div style="margin-top:12px;font-family:var(--mono);font-size:10.5px;color:var(--text3);word-break:break-all"
+         id="apiUrl"></div>
+  </div>
+
+  <div class="panel">
+    <div class="out-head">
+      <div class="out-title">// OUTPUT</div>
+      <div class="acts">
+        <button class="mini" onclick="copyAll()">COPY ALL</button>
+        <button class="mini" onclick="copyRaw()">COPY RAW ARRAY</button>
+        <button class="mini" onclick="openRaw()">VIEW RAW</button>
+        <button class="mini" onclick="clearOut()">CLEAR</button>
+      </div>
+    </div>
+    <div class="out-meta" id="outMeta">waiting for input…</div>
+    <div class="results" id="results"></div>
+  </div>
+
+  <footer>
+    🛒 Shopify Product Fetcher · v2.0<br />
+    Direct: <a href="?keyword=socks&format=raw">/?keyword=socks&format=raw</a> · 
+    <a href="?keyword=socks&stream=1">/?keyword=socks&stream=1</a>
+  </footer>
+
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let lastResults = [];
+let currentAbort = null;
+let debounceTimer = null;
+
+document.querySelectorAll('.tier').forEach(t => {
+  const cb = t.querySelector('input');
+  const sync = () => t.classList.toggle('active', cb.checked);
+  cb.addEventListener('change', sync); sync();
+});
+
+const avail = $('availSwitch');
+avail.addEventListener('click', () => avail.classList.toggle('on'));
+const streamSw = $('streamSwitch');
+streamSw.addEventListener('click', () => streamSw.classList.toggle('on'));
+
+$('visits').textContent = Math.floor(400 + Math.random() * 300).toLocaleString();
+
+function refreshUrl() {
+  const kw = $('keyword').value.trim() || 'socks';
+  let u = `/?keyword=${encodeURIComponent(kw)}&result=${$('result').value||100}`;
+  if (streamSw.classList.contains('on')) u += '&stream=1';
+  else if (document.getElementById('rawMode')?.checked) u += '&format=raw';
+  $('apiUrl').textContent = location.origin + u;
+}
+['keyword','result'].forEach(id => $(id).addEventListener('input', refreshUrl));
+refreshUrl();
+
+function clearOut() {
+  $('results').innerHTML = '<div class="empty"><span class="big">🛒</span>no results yet</div>';
+  $('outMeta').textContent = 'waiting…';
+  lastResults = [];
+}
+
+function copyAll() {
+  if (!lastResults.length) return alert('nothing to copy');
+  navigator.clipboard.writeText(JSON.stringify(lastResults, null, 2));
+  flash('Copied ' + lastResults.length + ' results');
+}
+function copyRaw() {
+  if (!lastResults.length) return alert('nothing to copy');
+  navigator.clipboard.writeText(JSON.stringify(lastResults));
+  flash('Copied raw JSON array');
+}
+function openRaw() {
+  if (!lastResults.length) return alert('nothing to copy');
+  const w = window.open('', '_blank');
+  w.document.write('<pre style="font-family:monospace;padding:20px;background:#08130f;color:#d8f5e3;font-size:12px">'
+    + JSON.stringify(lastResults, null, 2) + '</pre>');
+}
+function flash(msg) {
+  const b = document.createElement('div');
+  b.textContent = msg;
+  Object.assign(b.style, {
+    position: 'fixed', bottom: '30px', left: '50%', transform: 'translateX(-50%)',
+    background: 'var(--green)', color: '#04120a', padding: '10px 22px',
+    borderRadius: '10px', fontFamily: 'var(--mono)', fontWeight: '700',
+    fontSize: '12px', zIndex: 9999, boxShadow: '0 8px 30px rgba(0,255,136,.4)',
+    transition: 'opacity .2s'
+  });
+  document.body.appendChild(b);
+  setTimeout(() => { b.style.opacity = '0'; setTimeout(() => b.remove(), 200); }, 1400);
+}
+
+function renderCards(list, meta) {
+  if (!list.length) {
+    $('results').innerHTML = '<div class="empty"><span class="big">🔍</span>no products in $0.10–$5.00 range</div>';
+    $('outMeta').textContent = meta || 'done · 0 results';
+    return;
+  }
+  $('results').innerHTML = list.map((r, i) => `
+    <div class="card" style="animation-delay:${Math.min(i*20, 400)}ms">
+      <div class="card-head">
+        <span class="card-idx">[${String(i+1).padStart(3,'0')}]</span>
+        <button class="copy-btn" data-copy="${i}">COPY</button>
+      </div>
+      <div class="card-site">${r.site}</div>
+      <div class="card-meta" style="margin-top:6px">
+        <span class="kv"><span class="k">VARIANT</span><span class="v">${r.variant_id}</span></span>
+        <span class="kv"><span class="k">PRICE</span><span class="v price">${r.price}</span></span>
+      </div>
+      <div class="card-checkout" data-checkout="${r.checkout}">CHECKOUT ${r.checkout}</div>
+      ${r.title ? '<div class="tag">' + r.title + '</div>' : ''}
+    </div>
+  `).join('');
+
+  document.querySelectorAll('.copy-btn').forEach(b => {
+    b.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const idx = parseInt(b.dataset.copy, 10);
+      navigator.clipboard.writeText(JSON.stringify(lastResults[idx], null, 2));
+      b.textContent = 'COPIED'; b.classList.add('copied');
+      setTimeout(() => { b.textContent = 'COPY'; b.classList.remove('copied'); }, 1200);
+    });
+  });
+  document.querySelectorAll('.card-checkout').forEach(c => {
+    c.addEventListener('click', () => {
+      navigator.clipboard.writeText(c.dataset.checkout);
+      flash('Checkout URL copied');
+    });
+  });
+}
+
+async function runSearch() {
+  const kw = $('keyword').value.trim();
+  if (!kw) return;
+
+  if (currentAbort) currentAbort.abort();
+  currentAbort = new AbortController();
+
+  const isStream = streamSw.classList.contains('on');
+  $('go').disabled = true;
+  $('results').innerHTML = '<div class="empty"><span class="spinner"></span>searching…</div>';
+  $('outMeta').textContent = 'querying "' + kw + '"…';
+  $('progressWrap').style.display = 'block';
+  $('progressBar').style.width = '20%';
+
+  const t0 = performance.now();
+  lastResults = [];
+
+  try {
+    if (isStream) {
+      // ── streaming NDJSON ────────────────────────────
+      const url = `/?keyword=${encodeURIComponent(kw)}&result=${$('result').value||100}&stream=1`;
+      const resp = await fetch(url, { signal: currentAbort.signal });
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+      $('progressBar').style.width = '40%';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const lines = buf.split('\n');
+        buf = lines.pop();
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            const obj = JSON.parse(line);
+            if (obj.error) continue;
+            lastResults.push(obj);
+          } catch {}
+        }
+        if (lastResults.length % 5 === 0) {
+          renderCards(lastResults, 'streaming… ' + lastResults.length + ' results');
+        }
+      }
+      $('progressBar').style.width = '100%';
+    } else {
+      // ── buffered ─────────────────────────────────────
+      const url = `/?keyword=${encodeURIComponent(kw)}&result=${$('result').value||100}&format=raw`;
+      const resp = await fetch(url, { signal: currentAbort.signal });
+      $('progressBar').style.width = '70%';
+      const data = await resp.json();
+      lastResults = Array.isArray(data) ? data : (data.results || []);
+      $('progressBar').style.width = '100%';
+    }
+
+    const ms = Math.round(performance.now() - t0);
+    $('outMeta').innerHTML =
+      'RESULTS <span style="color:#00ff88">' + lastResults.length +
+      '</span> · "' + kw + '" · $0.10–$5.00 · <span style="color:#00ff88">' + ms + 'ms</span>';
+    renderCards(lastResults);
+  } catch (e) {
+    if (e.name === 'AbortError') return;
+    $('results').innerHTML = '<div class="err">' + e.message + '</div>';
+    $('outMeta').textContent = 'failed';
+  } finally {
+    $('go').disabled = false;
+    setTimeout(() => { $('progressWrap').style.display = 'none'; $('progressBar').style.width = '0'; }, 600);
+  }
+}
+
+// ── smart auto-run on typing (debounced) ────────────────
+$('keyword').addEventListener('input', () => {
+  clearTimeout(debounceTimer);
+  const kw = $('keyword').value.trim();
+  refreshUrl();
+  if (kw.length < 2) return;
+  debounceTimer = setTimeout(runSearch, 550);
+});
+$('keyword').addEventListener('keydown', e => {
+  if (e.key === 'Enter') { clearTimeout(debounceTimer); runSearch(); }
+});
+$('go').addEventListener('click', () => { clearTimeout(debounceTimer); runSearch(); });
+
+// initial
+clearOut();
+</script>
+</body>
+</html>
