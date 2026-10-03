@@ -1,8 +1,5 @@
 import json
 import os
-"""
-VXO Checker — Shopify Checkout Engine
-"""
 import random
 import re
 import time
