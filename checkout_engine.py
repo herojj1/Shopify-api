@@ -1,9 +1,5 @@
 import json
 import os
-"""
-VXO Checker — Shopify Checkout Engine
-Full c1 pipeline with checkpointData threading and captcha solver.
-"""
 import random
 import re
 import time
