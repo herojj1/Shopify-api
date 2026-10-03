@@ -6,7 +6,7 @@ export CHECK_TIMEOUT="${CHECK_TIMEOUT:-75}"
 export CAPTCHA_ENABLED="${CAPTCHA_ENABLED:-1}"
 export CAPTCHA_RETRIES="${CAPTCHA_RETRIES:-2}"
 
-# optional paid captcha fallback
+# optional paid captcha provider
 # export CAPTCHA_SERVICE=capsolver
 # export CAPTCHA_API_KEY=CAP-xxxxxxxxxxxxxxxx
 
