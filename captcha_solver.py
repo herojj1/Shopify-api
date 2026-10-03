@@ -1,9 +1,3 @@
-"""
-VXO captcha solver — v3 protobuf + v2 form-encoded + enterprise endpoints
-+ recaptcha.net domain trick + paid service fallback.
-
-FILL SHOP_SITEKEYS BELOW after running getkey.py.
-"""
 import base64
 import html as _html
 import json
