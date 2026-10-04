@@ -1,6 +1,7 @@
 """
-Sitekey finder. Run once per shop:
-    python3 getkey.py https://store.com http://user:pass@host:port
+Standalone sitekey finder.
+Run: python3 getkey.py https://store.com http://user:pass@host:port
+or:  python3 getkey.py https://store.com host:port:user:pass
 """
 import re
 import sys
@@ -10,12 +11,32 @@ from urllib.parse import urlparse
 from curl_cffi.requests import Session
 
 
+def _normalize_proxy(raw):
+    p = raw.strip()
+    if not p:
+        raise ValueError("empty proxy")
+    if "://" in p:
+        return p
+    parts = p.split(":")
+    if len(parts) == 4:
+        return f"http://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}"
+    return "http://" + p
+
+
 def main():
     if len(sys.argv) < 3:
-        print("usage: getkey.py <shop_url> <proxy_url>")
+        print("usage: getkey.py <shop_url> <proxy>")
         return
-    shop  = sys.argv[1].rstrip("/")
-    proxy = sys.argv[2]
+
+    shop = sys.argv[1].rstrip("/")
+    if not shop.startswith(("http://", "https://")):
+        shop = "https://" + shop
+
+    try:
+        proxy = _normalize_proxy(sys.argv[2])
+    except Exception as e:
+        print(f"[!] invalid proxy: {e}")
+        return
 
     s = Session(impersonate="chrome124", proxy=proxy, timeout=20)
     s.headers.update({
@@ -26,9 +47,15 @@ def main():
     })
 
     print(f"[*] shop={shop}")
+    print(f"[*] proxy={proxy.split('@')[-1] if '@' in proxy else proxy}")
 
-    r = s.get(f"{shop}/products.json?limit=250")
-    products = r.json().get("products", [])
+    try:
+        r = s.get(f"{shop}/products.json?limit=250")
+        products = r.json().get("products", [])
+    except Exception as e:
+        print(f"[!] products.json failed: {e}")
+        return
+
     variant = None
     for p in products:
         for v in p.get("variants", []):
@@ -39,10 +66,16 @@ def main():
         print("[!] no product available"); return
     print(f"[*] variant={variant}")
 
-    r = s.get(f"{shop}/cart/{variant}:1", allow_redirects=True)
-    checkout_html = r.text
-    checkout_url  = r.url
-    print(f"[*] checkout={checkout_url}  html_len={len(checkout_html)}")
+    try:
+        r = s.get(f"{shop}/cart/{variant}:1", allow_redirects=True)
+        checkout_html = r.text
+        checkout_url  = r.url
+    except Exception as e:
+        print(f"[!] checkout fetch failed: {e}")
+        return
+
+    print(f"[*] checkout={checkout_url}")
+    print(f"[*] html_len={len(checkout_html)}")
 
     decoded = _html.unescape(checkout_html).replace("&quot;", '"')
     found   = set()
@@ -76,7 +109,7 @@ def main():
             elif not u.startswith("http"): continue
             js_urls.add(u)
 
-        print(f"[*] {len(js_urls)} bundles")
+        print(f"[*] {len(js_urls)} bundles found")
         for u in sorted(js_urls):
             try:
                 r = s.get(u, headers={"Referer": checkout_url})
@@ -104,6 +137,7 @@ def main():
 
     print()
     host = urlparse(shop).hostname or ""
+
     if found:
         print("=== SITEKEY(S) FOUND ===")
         for k in found:
@@ -111,7 +145,8 @@ def main():
         print()
         print("Paste into captcha_solver.py:")
         print("SHOP_SITEKEYS = {")
-        print(f'    "{host}": "{list(found)[0]}",')
+        for k in found:
+            print(f'    "{host}": "{k}",')
         print("}")
     else:
         print("=== NO SITEKEY FOUND ===")
