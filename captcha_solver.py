@@ -1,6 +1,6 @@
 """
-VXO captcha solver — v3 protobuf + v2 form + enterprise endpoints +
-recaptcha.net domain trick + paid fallback.
+VXO captcha solver — v3 protobuf + v2 form + enterprise + recaptcha.net
++ /checkpoint fallback + hardcoded FALLBACK_SITEKEYS.
 """
 import base64
 import html as _html
@@ -18,12 +18,21 @@ from curl_cffi.requests import Session
 logger = logging.getLogger("vxo.captcha")
 
 # ══════════════════════════════════════════════════════════════════════
-# HARDCODE SITEKEYS HERE after calling /getkey
+# HARDCODED SITEKEYS
 # ══════════════════════════════════════════════════════════════════════
+
+# Per-shop exact-host overrides (wins over everything)
 SHOP_SITEKEYS: dict = {
-    # "www.32degrees.com":    "6Lcxxxxx",
-    # "www.bettertights.com": "6Lcxxxxx",
+    # "silkysocks.com": "6Lcxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
 }
+
+# Fallback list — tried in order for any shop without a per-shop entry.
+# Paste the sitekey you found here. Add multiple if you know several.
+FALLBACK_SITEKEYS: list = [
+    # "6Lcxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+]
+
+# ══════════════════════════════════════════════════════════════════════
 
 SERVICE  = os.environ.get("CAPTCHA_SERVICE", "").lower()
 API_KEY  = os.environ.get("CAPTCHA_API_KEY", "")
@@ -96,18 +105,28 @@ def probe_sitekey(client, shop_url: str, checkout_html: str, checkout_url: str) 
 
     host = urlparse(shop_url).hostname or ""
 
+    # 1) per-shop hardcode
     if host in SHOP_SITEKEYS and SHOP_SITEKEYS[host]:
         key = SHOP_SITEKEYS[host]
-        logger.info(f"sitekey from hardcode ({host}): {key[:16]}…")
+        logger.info(f"sitekey from shop hardcode ({host}): {key[:16]}…")
         _SITEKEY_CACHE[shop_url] = key
         return key
 
+    # 2) global fallback list (shared Shopify checkout sitekey)
+    if FALLBACK_SITEKEYS:
+        key = FALLBACK_SITEKEYS[0]
+        logger.info(f"sitekey from FALLBACK list: {key[:16]}…")
+        _SITEKEY_CACHE[shop_url] = key
+        return key
+
+    # 3) checkout HTML
     key = _extract_from_body(checkout_html)
     if key:
         logger.info(f"sitekey from HTML: {key[:16]}…")
         _SITEKEY_CACHE[shop_url] = key
         return key
 
+    # 4) JS bundles referenced in checkout HTML
     js_urls = _collect_script_urls(checkout_html, shop_url)
     logger.info(f"sitekey not in HTML — scanning {len(js_urls)} JS bundles")
 
@@ -124,6 +143,20 @@ def probe_sitekey(client, shop_url: str, checkout_html: str, checkout_url: str) 
         except Exception:
             continue
 
+    # 5) /checkpoint page (where Shopify hides captcha)
+    try:
+        checkpoint_url = f"{shop_url.rstrip('/')}/checkpoint"
+        r = client.get(checkpoint_url, headers={"Referer": checkout_url})
+        if r.status_code == 200:
+            key = _extract_from_body(r.text)
+            if key:
+                logger.info(f"sitekey from /checkpoint: {key[:16]}…")
+                _SITEKEY_CACHE[shop_url] = key
+                return key
+    except Exception:
+        pass
+
+    # 6) serialized meta tags
     for m in re.finditer(r'<meta\s+name="(serialized-[^"]+)"\s+content="([^"]*)"',
                          checkout_html or ""):
         key = _extract_from_body(_html.unescape(m.group(2)))
@@ -132,10 +165,11 @@ def probe_sitekey(client, shop_url: str, checkout_html: str, checkout_url: str) 
             _SITEKEY_CACHE[shop_url] = key
             return key
 
-    logger.warning("no sitekey found — run /getkey and fill SHOP_SITEKEYS")
+    logger.warning("no sitekey anywhere — fill FALLBACK_SITEKEYS")
     return ""
 
 
+# ── v3 protobuf ──────────────────────────────────────────────────────
 def _to_base36(num: int) -> str:
     if num == 0: return "0"
     out = ""
@@ -423,11 +457,23 @@ def solve(sitekey, page_url, proxy_url="", user_agent=DEFAULT_UA,
     if not sitekey:
         return ""
     logger.info(f"solving captcha sitekey={sitekey[:16]}… page={page_url}")
+
     tok = _v3_solve(sitekey, page_url, proxy_url, user_agent, impersonate)
-    if tok: return tok
+    if tok:
+        logger.info(f"solved via v3 ({len(tok)} chars)")
+        return tok
+    logger.debug("v3 returned nothing — trying v2")
+
     tok = _v2_solve(sitekey, page_url, proxy_url, user_agent, impersonate)
-    if tok: return tok
+    if tok:
+        logger.info(f"solved via v2 ({len(tok)} chars)")
+        return tok
+    logger.debug("v2 returned nothing — trying paid service")
+
     tok = _paid_solve(sitekey, page_url, proxy_url, impersonate)
-    if tok: return tok
+    if tok:
+        logger.info(f"solved via paid service ({len(tok)} chars)")
+        return tok
+
     logger.warning("all captcha paths failed")
     return ""
