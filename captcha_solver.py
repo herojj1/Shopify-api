@@ -1,3 +1,7 @@
+"""
+VXO captcha solver — v3 protobuf + v2 form + enterprise endpoints +
+recaptcha.net domain trick + paid fallback.
+"""
 import base64
 import html as _html
 import json
@@ -13,8 +17,12 @@ from curl_cffi.requests import Session
 
 logger = logging.getLogger("vxo.captcha")
 
+# ══════════════════════════════════════════════════════════════════════
+# HARDCODE SITEKEYS HERE after calling /getkey
+# ══════════════════════════════════════════════════════════════════════
 SHOP_SITEKEYS: dict = {
-    # "stickerhorse.com": "PASTE_HERE",
+    # "www.32degrees.com":    "6Lcxxxxx",
+    # "www.bettertights.com": "6Lcxxxxx",
 }
 
 SERVICE  = os.environ.get("CAPTCHA_SERVICE", "").lower()
@@ -85,19 +93,24 @@ def _collect_script_urls(checkout_html: str, shop_url: str) -> list:
 def probe_sitekey(client, shop_url: str, checkout_html: str, checkout_url: str) -> str:
     if shop_url in _SITEKEY_CACHE:
         return _SITEKEY_CACHE[shop_url]
+
     host = urlparse(shop_url).hostname or ""
+
     if host in SHOP_SITEKEYS and SHOP_SITEKEYS[host]:
         key = SHOP_SITEKEYS[host]
         logger.info(f"sitekey from hardcode ({host}): {key[:16]}…")
         _SITEKEY_CACHE[shop_url] = key
         return key
+
     key = _extract_from_body(checkout_html)
     if key:
         logger.info(f"sitekey from HTML: {key[:16]}…")
         _SITEKEY_CACHE[shop_url] = key
         return key
+
     js_urls = _collect_script_urls(checkout_html, shop_url)
     logger.info(f"sitekey not in HTML — scanning {len(js_urls)} JS bundles")
+
     for url in js_urls:
         try:
             r = client.get(url, headers={"Referer": checkout_url, "Accept": "*/*"})
@@ -110,6 +123,7 @@ def probe_sitekey(client, shop_url: str, checkout_html: str, checkout_url: str) 
                 return key
         except Exception:
             continue
+
     for m in re.finditer(r'<meta\s+name="(serialized-[^"]+)"\s+content="([^"]*)"',
                          checkout_html or ""):
         key = _extract_from_body(_html.unescape(m.group(2)))
@@ -117,7 +131,8 @@ def probe_sitekey(client, shop_url: str, checkout_html: str, checkout_url: str) 
             logger.info(f"sitekey from meta {m.group(1)}: {key[:16]}…")
             _SITEKEY_CACHE[shop_url] = key
             return key
-    logger.warning("no sitekey found — run getkey.py and fill SHOP_SITEKEYS")
+
+    logger.warning("no sitekey found — run /getkey and fill SHOP_SITEKEYS")
     return ""
 
 
