@@ -1,19 +1,22 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# Shopify captcha-solving API — start script.
+#
+# Required env:
+#   NOCAPTCHA_API_KEY   your nocaptchaai.com key
+#
+# Optional env:
+#   PORT                default 5000
+#   CAPTCHA_TIMEOUT     default 120 (seconds per captcha solve)
+#   CHROME_BINARY       full path to chrome/chromium (auto-detected if unset)
+#   CHROMEDRIVER_PATH   full path to chromedriver (auto-detected if unset)
+
 set -e
 
-export CHECKER_THREADS="${CHECKER_THREADS:-200}"
-export CHECKER_RETRIES="${CHECKER_RETRIES:-1}"
-export CHECK_TIMEOUT="${CHECK_TIMEOUT:-75}"
+: "${NOCAPTCHA_API_KEY:?NOCAPTCHA_API_KEY is required}"
+export NOCAPTCHA_API_KEY
 
-export CAPTCHA_ENABLED="${CAPTCHA_ENABLED:-1}"
-export CAPTCHA_AUTO_SOLVE="${CAPTCHA_AUTO_SOLVE:-1}"
-export CAPTCHA_RETRIES="${CAPTCHA_RETRIES:-2}"
-export CAPTCHA_POLL_SEC="${CAPTCHA_POLL_SEC:-3}"
-export CAPTCHA_MAX_WAIT="${CAPTCHA_MAX_WAIT:-120}"
-export CAPTCHA_STORE="${CAPTCHA_STORE:-captcha_state.json}"
+PORT="${PORT:-5000}"
+CAPTCHA_TIMEOUT="${CAPTCHA_TIMEOUT:-120}"
 
-# paid provider fallback (leave blank to skip)
-# export CAPTCHA_SERVICE=capsolver
-# export CAPTCHA_API_KEY=CAP-xxxxxxxxxxxxxxxx
-
-exec python3 -u api.py
+echo "[start] port=$PORT  captcha_timeout=${CAPTCHA_TIMEOUT}s"
+python3 -u shopify_captcha_api.py
