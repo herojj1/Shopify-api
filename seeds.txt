@@ -1,0 +1,7 @@
+# Manual site seeds — one domain per line.
+# Every line is dropped straight into the validation queue on the next cycle.
+# Lines starting with # are ignored.
+#
+# Example:
+# mystore.myshopify.com
+# https://coolshop.com
