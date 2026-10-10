@@ -2,14 +2,10 @@
 site_fetcher.py — Shopify site discovery + pool.
 
 Discovery sources:
-  1. seeds.txt       — manual domains (highest priority)
-  2. Bing RSS        — https://www.bing.com/search?q=...&format=rss
-  3. DuckDuckGo HTML — https://html.duckduckgo.com/html/?q=...
-  4. DuckDuckGo Lite — https://lite.duckduckgo.com/lite/
-
-Validation:
-  • GET /products.json?limit=250
-  • Must contain products with available variant priced MIN_PRICE..MAX_PRICE
+  1. seeds.txt    — manual domains (highest priority)
+  2. Bing RSS     — https://www.bing.com/search?q=...&format=rss
+  (DDG endpoints are kept as a fallback but with a 3s timeout so they
+   can't stall the cycle. Bing is the primary — it works from cloud IPs.)
 """
 from __future__ import annotations
 
@@ -29,12 +25,14 @@ import httpx
 
 log = logging.getLogger("sites")
 
+# ── paths ──────────────────────────────────────────────────────────────────
 BASE_DIR      = Path(__file__).parent
 CACHE_FILE    = BASE_DIR / "site_cache.json"
 STATE_FILE    = BASE_DIR / "harvest_state.json"
 KEYWORDS_FILE = BASE_DIR / "keywords.txt"
 SEEDS_FILE    = BASE_DIR / "seeds.txt"
 
+# ── config ─────────────────────────────────────────────────────────────────
 MAX_PRICE         = float(os.environ.get("HARVEST_MAX_PRICE", "5.00"))
 MIN_PRICE         = float(os.environ.get("HARVEST_MIN_PRICE", "0.10"))
 POOL_MAX          = int(os.environ.get("SITE_POOL_MAX", "800"))
@@ -45,6 +43,7 @@ REVALIDATE_HOURS  = int(os.environ.get("HARVEST_REVALIDATE_HOURS", "24"))
 SEEDS_ONLY        = os.environ.get("SEEDS_ONLY", "").lower() in ("1", "true", "yes")
 DEBUG_DISCOVERY   = os.environ.get("HARVEST_DEBUG", "1").lower() in ("1", "true", "yes")
 
+# ── state ──────────────────────────────────────────────────────────────────
 _LOCK      = threading.Lock()
 _POOL: list[str]             = []
 _FAIL: dict[str, int]        = {}
@@ -164,7 +163,7 @@ _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 
 
 def _bing_rss(keyword: str, page: int, timeout: float = 12.0) -> list[str]:
-    """Bing RSS — clean XML."""
+    """Bing RSS — clean XML. Primary source."""
     q = urllib.parse.quote_plus(f"site:myshopify.com {keyword}")
     first = page * 10 + 1
     url = f"https://www.bing.com/search?q={q}&first={first}&count=20&format=rss"
@@ -195,8 +194,8 @@ def _bing_rss(keyword: str, page: int, timeout: float = 12.0) -> list[str]:
         return []
 
 
-def _ddg_html(keyword: str, timeout: float = 12.0) -> list[str]:
-    """DDG HTML — GET."""
+def _ddg_html(keyword: str, timeout: float = 3.0) -> list[str]:
+    """DDG HTML — 3s timeout, kept as fallback only."""
     q = urllib.parse.quote_plus(f"site:myshopify.com {keyword}")
     url = f"https://html.duckduckgo.com/html/?q={q}"
     headers = {
@@ -207,7 +206,6 @@ def _ddg_html(keyword: str, timeout: float = 12.0) -> list[str]:
     try:
         r = httpx.get(url, headers=headers, timeout=timeout, follow_redirects=True)
         if r.status_code != 200:
-            log.info("[disc] ddg_html %r -> HTTP %d", keyword, r.status_code)
             return []
         out: list[str] = []
         for m in re.finditer(r'uddg=([^&"]+)', r.text):
@@ -223,8 +221,8 @@ def _ddg_html(keyword: str, timeout: float = 12.0) -> list[str]:
         return []
 
 
-def _ddg_lite(keyword: str, page: int, timeout: float = 12.0) -> list[str]:
-    """DDG Lite — POST."""
+def _ddg_lite(keyword: str, page: int, timeout: float = 3.0) -> list[str]:
+    """DDG Lite — 3s timeout, kept as fallback only."""
     data = {
         "q":  f"site:myshopify.com {keyword}",
         "s":  str(page * 20),
@@ -241,7 +239,6 @@ def _ddg_lite(keyword: str, page: int, timeout: float = 12.0) -> list[str]:
                        data=data, headers=headers,
                        timeout=timeout, follow_redirects=True)
         if r.status_code != 200:
-            log.info("[disc] ddg_lite %r p%d -> HTTP %d", keyword, page, r.status_code)
             return []
         out = _extract_urls(r.text)
         log.info("[disc] ddg_lite %r p%d -> %d urls", keyword, page, len(out))
@@ -284,29 +281,34 @@ def _discover(limit: int = 200) -> list[str]:
     if SEEDS_ONLY:
         return out
 
-    # ── 2. Web scraping
+    # ── 2. Bing RSS scraping (primary)
     kws = _load_keywords()
     if not kws:
         return out
 
     attempts = 0
-    max_attempts = max(12, limit // 4)
+    max_attempts = 10        # small — Bing is fast, no need for 50 attempts
+    bing_empty_streak = 0
+
     while len(out) < limit and attempts < max_attempts:
         attempts += 1
         kw_idx = _KW_CURSOR["kw_index"] % len(kws)
         page   = _KW_CURSOR["page"]
         kw     = kws[kw_idx]
 
-        src_idx = attempts % 3
-        if src_idx == 0:
-            urls = _bing_rss(kw, page)
-            _STATS["discover_hits"]["bing_rss"] += len(urls)
-        elif src_idx == 1:
-            urls = _ddg_html(kw)
-            _STATS["discover_hits"]["ddg_html"] += len(urls)
+        urls = _bing_rss(kw, page)
+        _STATS["discover_hits"]["bing_rss"] += len(urls)
+
+        if len(urls) == 0:
+            bing_empty_streak += 1
+            # If Bing returns nothing twice in a row, try DDG once
+            if bing_empty_streak >= 2:
+                log.info("[disc] bing empty x%d — trying ddg fallback", bing_empty_streak)
+                urls = _ddg_html(kw)
+                _STATS["discover_hits"]["ddg_html"] += len(urls)
+                bing_empty_streak = 0
         else:
-            urls = _ddg_lite(kw, page)
-            _STATS["discover_hits"]["ddg_lite"] += len(urls)
+            bing_empty_streak = 0
 
         page += 1
         if page >= PAGES_PER_KEYWORD:
@@ -320,7 +322,7 @@ def _discover(limit: int = 200) -> list[str]:
                 _SEEN.add(u)
                 out.append(u)
 
-        time.sleep(random.uniform(0.6, 1.4))
+        time.sleep(random.uniform(0.4, 0.9))
 
     _save_state()
     log.info("[disc] cycle: fresh=%d seeds=%d scraped=%d attempts=%d",
