@@ -1,22 +1,15 @@
 """
-site_fetcher.py — Self-hosted Shopify site discovery + pool.
+site_fetcher.py — Shopify site discovery + pool.
 
 Discovery sources:
-  1. DuckDuckGo Lite  (site:myshopify.com <keyword>)
-  2. Bing HTML        (site:myshopify.com <keyword>)
-  3. seeds.txt        (manual domains)
+  1. seeds.txt       — manual domains (highest priority)
+  2. Bing RSS        — https://www.bing.com/search?q=...&format=rss
+  3. DuckDuckGo HTML — https://html.duckduckgo.com/html/?q=...
+  4. DuckDuckGo Lite — https://lite.duckduckgo.com/lite/
 
-Validation per candidate:
-  • GET /products.json?limit=250 with fast timeout
-  • Must return JSON with a "products" list
-  • Shop must NOT be password-locked (401/403 on /products.json -> skip)
-  • At least one variant with: available=True, MIN_PRICE <= price <= MAX_PRICE
-
-Persistence:
-  site_cache.json    — working pool (auto-pruned, TTL refreshed by re-check)
-  harvest_state.json — keyword cursor, discovery stats
-
-Background thread runs cycles every HARVEST_INTERVAL seconds.
+Validation:
+  • GET /products.json?limit=250
+  • Must contain products with available variant priced MIN_PRICE..MAX_PRICE
 """
 from __future__ import annotations
 
@@ -28,6 +21,7 @@ import re
 import threading
 import time
 import urllib.parse
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
@@ -35,29 +29,28 @@ import httpx
 
 log = logging.getLogger("sites")
 
-# ── paths ──────────────────────────────────────────────────────────────────
-BASE_DIR       = Path(__file__).parent
-CACHE_FILE     = BASE_DIR / "site_cache.json"
-STATE_FILE     = BASE_DIR / "harvest_state.json"
-KEYWORDS_FILE  = BASE_DIR / "keywords.txt"
-SEEDS_FILE     = BASE_DIR / "seeds.txt"
+BASE_DIR      = Path(__file__).parent
+CACHE_FILE    = BASE_DIR / "site_cache.json"
+STATE_FILE    = BASE_DIR / "harvest_state.json"
+KEYWORDS_FILE = BASE_DIR / "keywords.txt"
+SEEDS_FILE    = BASE_DIR / "seeds.txt"
 
-# ── config ─────────────────────────────────────────────────────────────────
 MAX_PRICE         = float(os.environ.get("HARVEST_MAX_PRICE", "5.00"))
 MIN_PRICE         = float(os.environ.get("HARVEST_MIN_PRICE", "0.10"))
 POOL_MAX          = int(os.environ.get("SITE_POOL_MAX", "800"))
-HARVEST_INTERVAL  = int(os.environ.get("HARVEST_INTERVAL_SECS", "900"))       # 15 min
+HARVEST_INTERVAL  = int(os.environ.get("HARVEST_INTERVAL_SECS", "900"))
 PAGES_PER_KEYWORD = int(os.environ.get("HARVEST_PAGES_PER_KEYWORD", "3"))
 VALIDATE_WORKERS  = int(os.environ.get("HARVEST_VALIDATE_WORKERS", "24"))
 REVALIDATE_HOURS  = int(os.environ.get("HARVEST_REVALIDATE_HOURS", "24"))
+SEEDS_ONLY        = os.environ.get("SEEDS_ONLY", "").lower() in ("1", "true", "yes")
+DEBUG_DISCOVERY   = os.environ.get("HARVEST_DEBUG", "1").lower() in ("1", "true", "yes")
 
-# ── state ──────────────────────────────────────────────────────────────────
 _LOCK      = threading.Lock()
-_POOL: list[str]             = []           # working sites
+_POOL: list[str]             = []
 _FAIL: dict[str, int]        = {}
 _LAST_USE: dict[str, float]  = {}
 _LAST_GOOD: dict[str, float] = {}
-_SEEN: set[str]              = set()        # every domain ever tested
+_SEEN: set[str]              = set()
 _RR = 0
 _STATS = {
     "candidates_seen":    0,
@@ -67,6 +60,7 @@ _STATS = {
     "last_cycle_ts":      0,
     "last_cycle_found":   0,
     "cycles":             0,
+    "discover_hits":      {"seeds": 0, "bing_rss": 0, "ddg_html": 0, "ddg_lite": 0},
 }
 
 _KW_CURSOR = {"kw_index": 0, "page": 0}
@@ -88,21 +82,20 @@ def _save_json(path: Path, data: Any) -> None:
         log.warning("write %s failed: %s", path.name, exc)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  URL normalisation
-# ═══════════════════════════════════════════════════════════════════════════
+# ── URL normalisation ─────────────────────────────────────────────────────
 
 _URL_RE = re.compile(r"https?://[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
 _BLOCK_HOSTS = (
     "google.", "bing.", "duckduckgo.", "facebook.", "youtube.",
     "twitter.", "x.com", "instagram.", "linkedin.", "pinterest.",
-    "wikipedia.", "youtu.be", "tiktok.", "reddit.",
+    "wikipedia.", "youtu.be", "tiktok.", "reddit.", "microsoft.",
+    "apple.com", "amazon.", "ebay.", "shopify.com",
 )
 
 
 def _normalise(raw: Any) -> str | None:
     if isinstance(raw, dict):
-        raw = raw.get("url") or raw.get("site") or raw.get("shop_url") or raw.get("shopUrl")
+        raw = raw.get("url") or raw.get("site") or raw.get("shop_url") or raw.get("shopUrl") or raw.get("link")
     if not isinstance(raw, str):
         return None
     s = raw.strip().rstrip("/")
@@ -131,43 +124,27 @@ def _extract_urls(text: str) -> list[str]:
     return out
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  Keywords
-# ═══════════════════════════════════════════════════════════════════════════
+# ── Keywords ──────────────────────────────────────────────────────────────
 
 _DEFAULT_KEYWORDS = [
-    "sample", "samples", "trial", "mini", "travel size",
-    "sticker", "sticker pack", "sticker sheet", "stickers",
-    "patch", "pin", "keychain", "magnet", "bookmark",
-    "candy", "chocolate", "gummy", "gummies", "lollipop",
-    "tea sample", "coffee sample", "coffee beans", "coffee",
-    "seeds", "seed packet", "wildflower seeds",
-    "digital", "ebook", "template", "preset", "presets",
-    "printable", "planner", "wallpaper", "svg", "png",
-    "postcard", "greeting card", "thank you card",
-    "lip balm", "lip gloss", "face mask", "sheet mask",
-    "nail polish", "mini polish", "sample size",
-    "hair tie", "scrunchie", "bandana", "pin badge",
-    "hand sanitizer", "hand cream", "hand salve",
-    "hot sauce", "hot sauce sample", "spice packet",
-    "soap sample", "soap bar", "bath bomb",
-    "candle sample", "tea light", "wax melt",
-    "earrings", "ring", "bracelet", "necklace",
-    "enamel pin", "lapel pin", "coin", "challenge coin",
-    "wristband", "keyring", "key ring", "lanyard", "carabiner",
-    "temporary tattoo", "tattoo", "flash tattoo",
+    "sample", "samples", "mini", "travel size",
+    "sticker", "sticker pack", "stickers", "patch", "pin", "keychain",
+    "candy", "chocolate", "gummy", "lollipop",
+    "coffee sample", "tea sample", "seeds",
+    "digital", "ebook", "template", "preset", "printable",
+    "postcard", "greeting card",
+    "lip balm", "face mask", "nail polish",
+    "hot sauce", "spice packet", "soap sample", "soap bar",
+    "candle sample", "wax melt",
+    "earrings", "ring", "bracelet", "enamel pin", "challenge coin",
+    "wristband", "keyring", "lanyard", "carabiner",
+    "temporary tattoo", "flash tattoo",
     "sticker set", "sticker bundle", "decals",
-    "greeting cards", "notecard", "note card",
-    "gift tag", "gift tags", "labels",
-    "pin set", "coin set", "sticker lot",
-    "matcha sample", "herbal tea", "loose leaf",
-    "protein sample", "protein bar", "energy bar",
-    "snack bar", "granola", "honey sample",
-    "perfume sample", "fragrance sample", "cologne sample",
-    "shampoo sample", "conditioner sample",
-    "face cream sample", "serum sample",
-    "art print", "mini print", "photo print",
-    "poster mini", "sticker bomb",
+    "gift tag", "labels", "notecard",
+    "protein bar", "energy bar", "snack bar",
+    "perfume sample", "fragrance sample",
+    "shampoo sample", "serum sample",
+    "art print", "mini print", "poster mini",
 ]
 
 
@@ -180,22 +157,78 @@ def _load_keywords() -> list[str]:
     return list(_DEFAULT_KEYWORDS)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  Discovery
-# ═══════════════════════════════════════════════════════════════════════════
+# ── Discovery sources ─────────────────────────────────────────────────────
 
 _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
 
+def _bing_rss(keyword: str, page: int, timeout: float = 12.0) -> list[str]:
+    """Bing RSS — clean XML."""
+    q = urllib.parse.quote_plus(f"site:myshopify.com {keyword}")
+    first = page * 10 + 1
+    url = f"https://www.bing.com/search?q={q}&first={first}&count=20&format=rss"
+    headers = {
+        "user-agent": _UA,
+        "accept": "application/rss+xml, application/xml, text/xml, */*",
+    }
+    try:
+        r = httpx.get(url, headers=headers, timeout=timeout, follow_redirects=True)
+        if r.status_code != 200:
+            log.info("[disc] bing_rss %r p%d -> HTTP %d", keyword, page, r.status_code)
+            return []
+        out: list[str] = []
+        try:
+            root = ET.fromstring(r.text)
+            for item in root.iter():
+                tag = item.tag.split("}")[-1]
+                if tag == "link" and item.text:
+                    u = _normalise(item.text.strip())
+                    if u:
+                        out.append(u)
+        except ET.ParseError:
+            out = _extract_urls(r.text)
+        log.info("[disc] bing_rss %r p%d -> %d urls", keyword, page, len(out))
+        return out
+    except Exception as exc:
+        log.info("[disc] bing_rss %r p%d -> exc %s", keyword, page, exc)
+        return []
+
+
+def _ddg_html(keyword: str, timeout: float = 12.0) -> list[str]:
+    """DDG HTML — GET."""
+    q = urllib.parse.quote_plus(f"site:myshopify.com {keyword}")
+    url = f"https://html.duckduckgo.com/html/?q={q}"
+    headers = {
+        "user-agent": _UA,
+        "accept": "text/html,application/xhtml+xml",
+        "accept-language": "en-US,en;q=0.9",
+    }
+    try:
+        r = httpx.get(url, headers=headers, timeout=timeout, follow_redirects=True)
+        if r.status_code != 200:
+            log.info("[disc] ddg_html %r -> HTTP %d", keyword, r.status_code)
+            return []
+        out: list[str] = []
+        for m in re.finditer(r'uddg=([^&"]+)', r.text):
+            u = _normalise(urllib.parse.unquote(m.group(1)))
+            if u:
+                out.append(u)
+        if not out:
+            out = _extract_urls(r.text)
+        log.info("[disc] ddg_html %r -> %d urls", keyword, len(out))
+        return out
+    except Exception as exc:
+        log.info("[disc] ddg_html %r -> exc %s", keyword, exc)
+        return []
+
+
 def _ddg_lite(keyword: str, page: int, timeout: float = 12.0) -> list[str]:
-    """Scrape DuckDuckGo Lite. page is 0-based, 20 results per page."""
+    """DDG Lite — POST."""
     data = {
         "q":  f"site:myshopify.com {keyword}",
         "s":  str(page * 20),
         "dc": str(page * 20 + 1),
-        "o":  "json",
-        "api":"d.js",
         "kl": "us-en",
     }
     headers = {
@@ -208,30 +241,13 @@ def _ddg_lite(keyword: str, page: int, timeout: float = 12.0) -> list[str]:
                        data=data, headers=headers,
                        timeout=timeout, follow_redirects=True)
         if r.status_code != 200:
+            log.info("[disc] ddg_lite %r p%d -> HTTP %d", keyword, page, r.status_code)
             return []
-        return _extract_urls(r.text)
+        out = _extract_urls(r.text)
+        log.info("[disc] ddg_lite %r p%d -> %d urls", keyword, page, len(out))
+        return out
     except Exception as exc:
-        log.debug("ddg %r page %d failed: %s", keyword, page, exc)
-        return []
-
-
-def _bing(keyword: str, page: int, timeout: float = 12.0) -> list[str]:
-    """Scrape Bing HTML. page is 0-based, 10 results per page."""
-    q = urllib.parse.quote_plus(f"site:myshopify.com {keyword}")
-    first = page * 10 + 1
-    url = f"https://www.bing.com/search?q={q}&first={first}&count=20"
-    headers = {
-        "user-agent":      _UA,
-        "accept":          "text/html,application/xhtml+xml",
-        "accept-language": "en-US,en;q=0.9",
-    }
-    try:
-        r = httpx.get(url, headers=headers, timeout=timeout, follow_redirects=True)
-        if r.status_code != 200:
-            return []
-        return _extract_urls(r.text)
-    except Exception as exc:
-        log.debug("bing %r page %d failed: %s", keyword, page, exc)
+        log.info("[disc] ddg_lite %r p%d -> exc %s", keyword, page, exc)
         return []
 
 
@@ -249,30 +265,48 @@ def _load_seeds() -> list[str]:
     return out
 
 
-_STAGE: list[str] = []
+def _discover(limit: int = 200) -> list[str]:
+    """Return fresh candidates (seeds + scraped) not yet tested."""
+    out: list[str] = []
 
-
-def _discover(limit: int = 120) -> list[str]:
-    """Run a discovery cycle. Returns candidates not yet tested."""
-    kws   = _load_keywords()
+    # ── 1. Seeds first
     seeds = _load_seeds()
+    seed_added = 0
     for s in seeds:
         if s not in _SEEN:
             _SEEN.add(s)
-            _STAGE.append(s)
+            out.append(s)
+            seed_added += 1
+    if seed_added:
+        _STATS["discover_hits"]["seeds"] += seed_added
+        log.info("[disc] seeds: %d new (file has %d)", seed_added, len(seeds))
 
-    found: list[str] = []
+    if SEEDS_ONLY:
+        return out
+
+    # ── 2. Web scraping
+    kws = _load_keywords()
+    if not kws:
+        return out
+
     attempts = 0
-    max_attempts = max(8, limit // 8)
-
-    while len(found) + len(_STAGE) < limit and attempts < max_attempts:
+    max_attempts = max(12, limit // 4)
+    while len(out) < limit and attempts < max_attempts:
         attempts += 1
         kw_idx = _KW_CURSOR["kw_index"] % len(kws)
         page   = _KW_CURSOR["page"]
         kw     = kws[kw_idx]
 
-        source = _bing if attempts % 2 == 0 else _ddg_lite
-        urls   = source(kw, page)
+        src_idx = attempts % 3
+        if src_idx == 0:
+            urls = _bing_rss(kw, page)
+            _STATS["discover_hits"]["bing_rss"] += len(urls)
+        elif src_idx == 1:
+            urls = _ddg_html(kw)
+            _STATS["discover_hits"]["ddg_html"] += len(urls)
+        else:
+            urls = _ddg_lite(kw, page)
+            _STATS["discover_hits"]["ddg_lite"] += len(urls)
 
         page += 1
         if page >= PAGES_PER_KEYWORD:
@@ -282,23 +316,21 @@ def _discover(limit: int = 120) -> list[str]:
         _KW_CURSOR["page"]     = page
 
         for u in urls:
-            if u in _SEEN:
-                continue
-            _SEEN.add(u)
-            found.append(u)
+            if u not in _SEEN:
+                _SEEN.add(u)
+                out.append(u)
 
-        time.sleep(random.uniform(0.8, 1.8))
+        time.sleep(random.uniform(0.6, 1.4))
 
     _save_state()
-    return found
+    log.info("[disc] cycle: fresh=%d seeds=%d scraped=%d attempts=%d",
+             len(out), seed_added, len(out) - seed_added, attempts)
+    return out
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  Validation
-# ═══════════════════════════════════════════════════════════════════════════
+# ── Validation ────────────────────────────────────────────────────────────
 
 def _validate(shop_url: str, timeout: float = 12.0) -> tuple[bool, float]:
-    """Return (is_working, lowest_price)."""
     try:
         r = httpx.get(
             f"{shop_url}/products.json?limit=250",
@@ -320,7 +352,6 @@ def _validate(shop_url: str, timeout: float = 12.0) -> tuple[bool, float]:
     products = data.get("products") if isinstance(data, dict) else None
     if not isinstance(products, list) or not products:
         return False, 0.0
-
     low: float | None = None
     for p in products:
         for v in p.get("variants", []) or []:
@@ -341,7 +372,6 @@ def _validate(shop_url: str, timeout: float = 12.0) -> tuple[bool, float]:
 
 def _validate_batch(urls: list[str]) -> int:
     from concurrent.futures import ThreadPoolExecutor, as_completed
-
     added = 0
     with ThreadPoolExecutor(max_workers=VALIDATE_WORKERS, thread_name_prefix="validate") as ex:
         futs = {ex.submit(_validate, u): u for u in urls}
@@ -359,14 +389,11 @@ def _validate_batch(urls: list[str]) -> int:
                         _LAST_GOOD[u] = time.time()
                         added += 1
                         _STATS["candidates_kept"] += 1
+                        log.info("[pool] + %s", u)
             else:
                 _STATS["candidates_dropped"] += 1
     return added
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  Revalidation
-# ═══════════════════════════════════════════════════════════════════════════
 
 def _revalidate_old() -> int:
     cutoff = time.time() - REVALIDATE_HOURS * 3600
@@ -375,7 +402,6 @@ def _revalidate_old() -> int:
         return 0
     log.info("[harvest] revalidating %d stale sites", len(stale))
     from concurrent.futures import ThreadPoolExecutor, as_completed
-
     removed = 0
     with ThreadPoolExecutor(max_workers=VALIDATE_WORKERS, thread_name_prefix="reval") as ex:
         futs = {ex.submit(_validate, u): u for u in stale}
@@ -394,21 +420,15 @@ def _revalidate_old() -> int:
     return removed
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  Persistence
-# ═══════════════════════════════════════════════════════════════════════════
+# ── Persistence ───────────────────────────────────────────────────────────
 
 def _save_cache() -> None:
-    _save_json(CACHE_FILE, {
-        "sites":     _POOL,
-        "last_good": _LAST_GOOD,
-        "ts":        time.time(),
-    })
+    _save_json(CACHE_FILE, {"sites": _POOL, "last_good": _LAST_GOOD, "ts": time.time()})
 
 
 def _load_cache() -> None:
     global _POOL, _LAST_GOOD, _SEEN
-    data  = _load_json(CACHE_FILE, {})
+    data = _load_json(CACHE_FILE, {})
     sites = data.get("sites") or []
     if isinstance(sites, list):
         _POOL = [u for u in (_normalise(x) for x in sites) if u][:POOL_MAX]
@@ -425,7 +445,7 @@ def _save_state() -> None:
 
 def _load_state() -> None:
     data = _load_json(STATE_FILE, {})
-    cur  = data.get("cursor") or {}
+    cur = data.get("cursor") or {}
     if isinstance(cur, dict):
         _KW_CURSOR["kw_index"] = int(cur.get("kw_index", 0))
         _KW_CURSOR["page"]     = int(cur.get("page", 0))
@@ -436,40 +456,33 @@ def _load_state() -> None:
                 _STATS[k] = st[k]
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  Background harvester
-# ═══════════════════════════════════════════════════════════════════════════
+# ── Background harvester ──────────────────────────────────────────────────
 
 _HARVEST_THREAD: threading.Thread | None = None
 _HARVEST_STOP = threading.Event()
 
 
 def _harvest_loop() -> None:
-    log.info("[harvest] thread started (interval %ds)", HARVEST_INTERVAL)
-    if _HARVEST_STOP.wait(5):
+    log.info("[harvest] thread started (interval %ds, seeds_only=%s)",
+             HARVEST_INTERVAL, SEEDS_ONLY)
+    if _HARVEST_STOP.wait(3):
         return
     while not _HARVEST_STOP.is_set():
         try:
             _STATS["cycles"] += 1
             t0 = time.time()
-
             removed = _revalidate_old()
             fresh   = _discover(limit=200)
             _STATS["candidates_seen"] += len(fresh)
             added   = _validate_batch(fresh)
-
             _STATS["last_cycle_ts"]    = int(t0)
             _STATS["last_cycle_found"] = added
             _save_cache()
             _save_state()
-
-            log.info(
-                "[harvest] cycle %d: discovered=%d added=%d removed_stale=%d pool=%d (%.1fs)",
-                _STATS["cycles"], len(fresh), added, removed, len(_POOL), time.time() - t0,
-            )
+            log.info("[harvest] cycle %d: discovered=%d added=%d removed=%d pool=%d (%.1fs)",
+                     _STATS["cycles"], len(fresh), added, removed, len(_POOL), time.time() - t0)
         except Exception as exc:
             log.exception("[harvest] cycle error: %s", exc)
-
         if _HARVEST_STOP.wait(HARVEST_INTERVAL):
             return
 
@@ -499,17 +512,14 @@ def harvest_once(limit: int = 200) -> dict:
         "added":      added,
         "removed":    removed,
         "pool":       len(_POOL),
+        "sources":    dict(_STATS["discover_hits"]),
     }
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  Public pool API
-# ═══════════════════════════════════════════════════════════════════════════
+# ── Public pool API ───────────────────────────────────────────────────────
 
 def _score(url: str) -> tuple[int, float]:
-    fails = _FAIL.get(url, 0)
-    last  = _LAST_USE.get(url, 0.0)
-    return (fails, last)
+    return (_FAIL.get(url, 0), _LAST_USE.get(url, 0.0))
 
 
 def pick_site(exclude: set[str] | None = None) -> str | None:
@@ -564,17 +574,18 @@ def snapshot() -> dict:
             "harvest_interval": HARVEST_INTERVAL,
             "max_price":        MAX_PRICE,
             "min_price":        MIN_PRICE,
+            "seeds_only":       SEEDS_ONLY,
         }
 
 
-# ── boot ───────────────────────────────────────────────────────────────────
+# ── Boot ──────────────────────────────────────────────────────────────────
 _load_cache()
 _load_state()
 if not KEYWORDS_FILE.is_file():
     KEYWORDS_FILE.write_text("\n".join(_DEFAULT_KEYWORDS) + "\n", encoding="utf-8")
 if not SEEDS_FILE.is_file():
     SEEDS_FILE.write_text(
-        "# One domain per line. Every line goes straight into the validation queue.\n"
+        "# One domain per line. Every line goes straight into validation.\n"
         "# Example:\n"
         "# mystore.myshopify.com\n",
         encoding="utf-8",
