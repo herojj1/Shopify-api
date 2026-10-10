@@ -1,22 +1,23 @@
 #!/usr/bin/env bash
-# Shopify captcha-solving API — start script.
-#
-# Required env:
-#   NOCAPTCHA_API_KEY   your nocaptchaai.com key
-#
-# Optional env:
-#   PORT                default 5000
-#   CAPTCHA_TIMEOUT     default 120 (seconds per captcha solve)
-#   CHROME_BINARY       full path to chrome/chromium (auto-detected if unset)
-#   CHROMEDRIVER_PATH   full path to chromedriver (auto-detected if unset)
-
+# CardCheckout API launcher
 set -e
 
-: "${NOCAPTCHA_API_KEY:?NOCAPTCHA_API_KEY is required}"
-export NOCAPTCHA_API_KEY
+export CHECKER_THREADS="${CHECKER_THREADS:-100}"
+export CHECKER_RETRIES="${CHECKER_RETRIES:-1}"
+export CHECKER_TIMEOUT="${CHECKER_TIMEOUT:-120}"
+export PORT="${PORT:-8081}"
 
-PORT="${PORT:-5000}"
-CAPTCHA_TIMEOUT="${CAPTCHA_TIMEOUT:-120}"
+export HARVEST_INTERVAL_SECS="${HARVEST_INTERVAL_SECS:-900}"
+export HARVEST_MAX_PRICE="${HARVEST_MAX_PRICE:-5.00}"
+export HARVEST_MIN_PRICE="${HARVEST_MIN_PRICE:-0.10}"
+export HARVEST_PAGES_PER_KEYWORD="${HARVEST_PAGES_PER_KEYWORD:-3}"
+export HARVEST_VALIDATE_WORKERS="${HARVEST_VALIDATE_WORKERS:-24}"
+export HARVEST_REVALIDATE_HOURS="${HARVEST_REVALIDATE_HOURS:-24}"
+export SITE_POOL_MAX="${SITE_POOL_MAX:-800}"
 
-echo "[start] port=$PORT  captcha_timeout=${CAPTCHA_TIMEOUT}s"
-python3 -u shopify_captcha_api.py
+exec python3 -u -m uvicorn api_server:app \
+  --host 0.0.0.0 \
+  --port "$PORT" \
+  --workers 1 \
+  --timeout-keep-alive 60 \
+  --log-level warning
