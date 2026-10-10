@@ -1,7 +1,38 @@
-# Manual site seeds — one domain per line.
-# Every line is dropped straight into the validation queue on the next cycle.
-# Lines starting with # are ignored.
-#
-# Example:
-# mystore.myshopify.com
-# https://coolshop.com
+cnfactory.myshopify.com
+skinincorporated.myshopify.com
+htfmerch.com
+stuffypuffs.com
+solapparels.com
+kukkiakids-us.myshopify.com
+boparfum.myshopify.com
+arundelbike.com
+fountpaper.myshopify.com
+theventashop.com
+omega-shop.myshopify.com
+sharetea-everett-online.myshopify.com
+mytiibo.myshopify.com
+washnwhips.myshopify.com
+goprintplus.myshopify.com
+hanger-frames.myshopify.com
+scooch-case.myshopify.com
+maplexo.myshopify.com
+hyde-tools.myshopify.com
+customsplice.myshopify.com
+mellow-monkey.myshopify.com
+myplusonelive.myshopify.com
+missjonesbakingco.myshopify.com
+totofabrics.myshopify.com
+hookeze.myshopify.com
+lucky-deluxe-sewing-supplies.myshopify.com
+statement-goods.myshopify.com
+wellsoil.myshopify.com
+countycomm.myshopify.com
+toner-refill-store.myshopify.com
+makeuperaserofficial.myshopify.com
+roostforhome.myshopify.com
+dogtuff.myshopify.com
+simple-alchemy-co.myshopify.com
+usefullcompany.myshopify.com
+jensen-fragrances.myshopify.com
+waffles-pet-supplies.myshopify.com
+daysoft-usa.myshopify.com
