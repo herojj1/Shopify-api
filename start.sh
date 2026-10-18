@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# CardCheckout API launcher
 set -e
 
 export CHECKER_THREADS="${CHECKER_THREADS:-100}"
